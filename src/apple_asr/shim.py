@@ -179,7 +179,11 @@ def _first_json_line(text: str) -> dict[str, Any]:
 
 
 def list_locales() -> Locales:
-    """Ask the shim which locales are installed and supported."""
+    """Ask the shim which locales are installed and which the OS supports.
+
+    Raises :class:`UnsupportedPlatform` off macOS 26, :class:`ShimUnavailable`
+    when no shim can be resolved, and :class:`BackendError` on a shim failure.
+    """
     require_supported()
     path = resolve_shim()
     proc = subprocess.run([path, "--list-locales"], capture_output=True, text=True, timeout=120)
@@ -195,7 +199,11 @@ def list_locales() -> Locales:
 
 
 def ensure_installed(locale: str) -> None:
-    """Install/reserve the locale asset; raise :class:`AssetUnavailable` on failure."""
+    """Install/reserve the locale's on-device asset; block until it is available.
+
+    Raises :class:`AssetUnavailable` (with the shim's stderr tail) when the
+    asset cannot be installed or reserved for `locale`.
+    """
     require_supported()
     path = resolve_shim()
     proc = subprocess.run(
@@ -209,7 +217,11 @@ def ensure_installed(locale: str) -> None:
 
 
 def shim_info() -> ShimInfo:
-    """Resolve the shim and report the `hello`-advertised identity."""
+    """Resolve the shim and report the identity it advertises in `hello`.
+
+    `build` is the executable's mtime as ISO-8601 UTC (the spec does not define
+    the field); `path` is the resolved absolute path.
+    """
     require_supported()
     path = resolve_shim()
     hello = read_hello(path)

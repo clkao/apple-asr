@@ -5,9 +5,9 @@ on:
   pull_request:
 
 jobs:
-  # Order-1 placeholder: runs anywhere, no Speech framework, no macOS. The
-  # order-2 suite drives the transport through a scripted fake shim on these
-  # runners (tests/fixtures/), so the matrix is pinned now.
+  # Runs anywhere: the whole suite outside the `integration` marker drives the
+  # transport with a scripted fake shim (tests/fixtures/fake_shim.py) in a tmp
+  # APPLE_ASR_CACHE. No macOS, no Speech framework, no writable ~/.cache.
   fake-shim:
     name: fake-shim tests (ubuntu, py${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -28,9 +28,13 @@ jobs:
         run: python -c "import apple_asr; print(apple_asr.__version__)"
       - name: Lint
         run: ruff check .
-      - name: Tests (populated in order 2)
-        run: |
-          if [ -d tests ]; then pytest -q; else echo "no tests yet (order 2)"; fi
+      - name: Tests (fake shim; integration marked tests skip off macOS 26)
+        run: pytest -q -m "not integration"
 
-  # macOS 26 integration tests (order 2) need a macOS 26 runner; that job is
-  # added with the test suite so it is not a red placeholder now.
+  # The macOS 26 integration tests (tests/test_integration_*.py) need a macOS 26
+  # runner with the Speech framework and a built shim:
+  #   python -m apple_asr.build
+  #   pytest -q -m integration
+  # No such public runner exists yet (GitHub's newest is macos-15), so this job
+  # is intentionally not declared here rather than left red. Run it on a real
+  # macOS 26 machine; the tests fail loudly there if the shim cannot be resolved.

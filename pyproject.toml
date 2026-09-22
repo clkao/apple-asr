@@ -30,6 +30,17 @@ dev = ["ruff>=0.6", "pytest>=7.0"]
 
 [project.scripts]
 apple-asr-shim = "apple_asr.cli:main"
+apple-asr-replay = "apple_asr.replay:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "integration: needs macOS 26+ and the real shim (skipped on other platforms)",
+]
+filterwarnings = [
+    "error::DeprecationWarning:apple_asr.*",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/apple_asr"]
@@ -44,3 +55,7 @@ src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The fake shim is test scaffolding that must stay a standalone script.
+"tests/fixtures/fake_shim.py" = ["E501"]

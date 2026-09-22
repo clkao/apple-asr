@@ -17,8 +17,10 @@
 //   --pause-commit <s>   quiet seconds before a pause commits (default 0.08)
 //   --commit-interval <s>  commit-latency ceiling; 0 = pause-only (default 0)
 //   --vad-sensitivity <l>  off|low|medium|high (inert in the prototype)
-//   --fast / --no-fast   add/remove the .fastResults reporting option
+//   --no-fast            drop the .fastResults reporting option (adds accuracy)
+//   --fast               DEPRECATED no-op, accepted for CLI compatibility only
 //   --no-volatile        disable volatile (partial) results
+//   --no-confidence      omit per-run transcriptionConfidence
 //   --list-locales       print {"type":"locales",...} and exit 0
 //   --ensure-installed <id>  install the locale asset or exit nonzero
 //
@@ -378,15 +380,21 @@ struct AppleAsrShim {
                 print("usage: apple-asr-shim {--stdin|--file PATH|--mic} "
                     + "[--locale L] [--preset P] [--context a,b,c] "
                     + "[--pause-commit S] [--commit-interval S] "
-                    + "[--vad-sensitivity off|low|medium|high] [--fast] [--no-fast] [--no-volatile]")
+                    + "[--vad-sensitivity off|low|medium|high] "
+                    + "[--no-fast] [--no-volatile] [--no-confidence]")
                 print("       apple-asr-shim --list-locales")
                 print("       apple-asr-shim --ensure-installed LOCALE")
+                print("")
+                print("  --fast is deprecated and ignored (fastResults is on unless")
+                print("  --no-fast is given). --help does not build anything: the")
+                print("  console script prints its own flag list without a build.")
                 return
             default: fatal("unknown arg: \(a)")
             }
         }
 
-        _ = fast  // accepted for CLI compatibility; the analyzer consumes as fast as it can
+        // Deprecated no-op (SPEC.md §4 lists it): the analyzer consumes as fast as it can.
+        _ = fast
 
         guard #available(macOS 26.0, *) else {
             fatal("requires macOS 26+ (Apple SpeechAnalyzer); this OS is older")

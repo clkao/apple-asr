@@ -155,7 +155,15 @@ def build_argv(
     commit_interval: float,
     context: tuple[str, ...] = (),
     confidence: bool = True,
+    fast_results: bool = True,
 ) -> list[str]:
+    """The shim argv for one session (SPEC.md §4 flags).
+
+    `fast_results=False` adds `--no-fast`, which drops the framework's
+    `.fastResults` reporting option (the ``accurate`` half of ``Stream(mode=)``).
+    The shim's own ``--fast`` flag is a deprecated no-op kept for CLI
+    compatibility, so it is never passed.
+    """
     argv = [
         shim_path,
         "--stdin",
@@ -172,6 +180,8 @@ def build_argv(
         argv += ["--context", ",".join(context)]
     if not confidence:
         argv.append("--no-confidence")
+    if not fast_results:
+        argv.append("--no-fast")
     return argv
 
 
@@ -189,7 +199,7 @@ def read_hello(path: str, timeout: float = 60.0) -> dict[str, Any]:
         stderr=subprocess.DEVNULL,
     )
     try:
-        line = _readline_with_timeout(proc, timeout)
+        line, _leftover = _readline_with_timeout(proc, timeout)
         if line is None:
             code = proc.poll()
             raise BackendError(
@@ -211,7 +221,13 @@ def read_hello(path: str, timeout: float = 60.0) -> dict[str, Any]:
         _kill(proc)
 
 
-def _readline_with_timeout(proc: subprocess.Popen, timeout: float) -> str | None:
+def _readline_with_timeout(proc: subprocess.Popen, timeout: float) -> tuple[str | None, bytes]:
+    """Read one line from `proc.stdout` within `timeout`.
+
+    Returns `(line, leftover)`: `leftover` is whatever else the single bulk read
+    pulled off the pipe (a fast shim can emit more lines in the same read — the
+    caller must not drop them).
+    """
     assert proc.stdout is not None
     fd = proc.stdout.fileno()
     deadline = time.monotonic() + timeout
@@ -219,17 +235,17 @@ def _readline_with_timeout(proc: subprocess.Popen, timeout: float) -> str | None
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return None
+            return None, buf
         ready, _, _ = select.select([fd], [], [], remaining)
         if not ready:
-            return None
+            return None, buf
         chunk = os.read(fd, 65536)
         if not chunk:
-            return buf.decode("utf-8", "replace").strip() or None
+            return buf.decode("utf-8", "replace").strip() or None, b""
         buf += chunk
         nl = buf.find(b"\n")
         if nl >= 0:
-            return buf[:nl].decode("utf-8", "replace").strip() or None
+            return buf[:nl].decode("utf-8", "replace").strip() or None, buf[nl + 1 :]
 
 
 def _kill(proc: subprocess.Popen) -> None:
@@ -268,6 +284,13 @@ class Transport:
         self._exited_code: int | None = None
         self._drop_warned = False
 
+        # Liveness bookkeeping for `Stream.silent_timeout` (SPEC.md §9 test 6):
+        # when the shim last said anything, and when the caller started feeding
+        # audio (so the guard can tell a fast-fed burst - legitimately quiet for
+        # seconds - from a hung backend fed at real time or slower).
+        self.last_event_monotonic = time.monotonic()
+        self.first_audio_monotonic: float | None = None
+
         # Commit acknowledgements: count + reason FIFO, paired with finals.
         self._commit_cv = threading.Condition()
         self._commit_count = 0
@@ -277,6 +300,10 @@ class Transport:
         # can shift the drift by a few ms mid-pause, so enforce contiguity here
         # rather than emit overlapping ranges.
         self._last_final_end = 0.0
+
+        # Bytes of stdout read while waiting for `hello`; the reader thread must
+        # consume them first (see `_readline_with_timeout`).
+        self._hello_leftover = b""
 
         self._counts = {"partials": 0, "finals": 0, "words": 0, "bytes": 0}
 
@@ -324,7 +351,8 @@ class Transport:
     # ------------------------------------------------------------------
     def _read_and_validate_hello(self, timeout: float) -> dict[str, Any]:
         assert self._proc.stdout is not None
-        line = _readline_with_timeout(self._proc, timeout)
+        line, leftover = _readline_with_timeout(self._proc, timeout)
+        self._hello_leftover = leftover
         if line is None:
             tail = self.stderr_tail()
             code = self._proc.poll()
@@ -381,31 +409,47 @@ class Transport:
     # ------------------------------------------------------------------
     def _read_loop(self) -> None:
         assert self._proc.stdout is not None
+        fd = self._proc.stdout.fileno()
+        buf = self._hello_leftover
         saw_ended = False
         try:
             while True:
-                raw = self._proc.stdout.readline()
-                if not raw:
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    raw, buf = buf[:nl], buf[nl + 1 :]
+                    if self._handle_line(raw):
+                        saw_ended = True
+                chunk = os.read(fd, 65536)
+                if not chunk:
                     break
-                line = raw.decode("utf-8", "replace").strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    self._warn(f"ignoring malformed JSON line from shim: {line[:160]!r}")
-                    continue
-                if not isinstance(obj, dict):
-                    self._warn(f"ignoring non-object JSON event: {line[:160]!r}")
-                    continue
-                kind = obj.get("type")
-                if kind == "ended":
-                    saw_ended = True
-                self._dispatch(obj)
+                buf += chunk
         except Exception as exc:  # pragma: no cover - defensive
             self._warn(f"reader thread failed: {exc!r}")
         finally:
             self._finish(saw_ended)
+
+    def _handle_line(self, raw: bytes) -> bool:
+        """Map one stdout line onto the queue. Returns True when it was `ended`.
+
+        Any line (even a malformed one) proves the shim is alive: it feeds the
+        liveness clock behind `Stream.silent_timeout`.
+        """
+        line = raw.decode("utf-8", "replace").strip()
+        if not line:
+            return False
+        self.last_event_monotonic = time.monotonic()
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            self._warn(f"ignoring malformed JSON line from shim: {line[:160]!r}")
+            return False
+        if not isinstance(obj, dict):
+            self._warn(f"ignoring non-object JSON event: {line[:160]!r}")
+            return False
+        self._dispatch(obj)
+        return obj.get("type") == "ended"
 
     def _dispatch(self, obj: dict[str, Any]) -> None:
         kind = obj.get("type")
@@ -440,6 +484,17 @@ class Transport:
         )
 
     def _make_final(self, obj: dict[str, Any]) -> Final:
+        # `Final.start` is clamped up to the previous final's end (SPEC.md §3.3:
+        # ranges never overlap). The clamp is load-bearing, not cosmetic: while a
+        # pause is open the client has already written its synthesized silence
+        # but the shim's commit for it only *arrives* a moment later, so the two
+        # finals are mapped with different drift terms and the new final's start
+        # maps before the previous final's end. Measured in
+        # tests/test_clock_accounting.py: 0.05 s (one pump tick) in the ordinary
+        # push/pause/pause_end cycle, up to the 0.10 s pre-roll when the commits
+        # land at different offsets into their pauses. Clamping restores
+        # contiguity; that test is the regression test (it fails if this clamp is
+        # removed). See ORDER2-REPORT.md, decision D-4.
         rng = obj.get("range") or [0.0, 0.0]
         raw_start = float(rng[0] if rng and rng[0] is not None else 0.0)
         raw_end = float(rng[1] if len(rng) > 1 and rng[1] is not None else raw_start)
@@ -529,6 +584,8 @@ class Transport:
                     f"shim stdin is gone ({exc}); stderr tail:\n{self.stderr_tail()}"
                 ) from exc
             self._counts["bytes"] += len(data)
+            if self.first_audio_monotonic is None:
+                self.first_audio_monotonic = time.monotonic()
 
     def send_command(self, obj: dict[str, Any]) -> None:
         with self._command_lock:

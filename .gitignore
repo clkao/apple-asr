@@ -9,3 +9,6 @@ build/
 .ruff_cache/
 *.tmp
 .cache/
+
+# agent-runtime artifacts (subagent transcripts/prompts)
+.pi-subagents/

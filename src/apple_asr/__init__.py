@@ -1,7 +1,13 @@
 """apple-asr — streaming, on-device speech-to-text for macOS 26+ from Python.
 
 Public API (SPEC.md §3). No Apple type names appear here; JSONL is an internal
-transport detail.
+transport detail. Two entry points to know:
+
+* :class:`~apple_asr.stream.Stream` — the session. ``mode="streaming"`` (default)
+  gives volatile partials (~13.2 mean zh CER); ``mode="accurate"`` gives finals
+  only (~11.2). See MEASUREMENTS.md for the evidence.
+* :mod:`apple_asr.replay` — the real-time replay driver behind the
+  ``apple-asr-replay`` console script.
 """
 
 from __future__ import annotations
