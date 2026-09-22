@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Order-1 placeholder: runs anywhere, no Speech framework, no macOS. The
+  # order-2 suite drives the transport through a scripted fake shim on these
+  # runners (tests/fixtures/), so the matrix is pinned now.
+  fake-shim:
+    name: fake-shim tests (ubuntu, py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+      - name: Import check
+        run: python -c "import apple_asr; print(apple_asr.__version__)"
+      - name: Lint
+        run: ruff check .
+      - name: Tests (populated in order 2)
+        run: |
+          if [ -d tests ]; then pytest -q; else echo "no tests yet (order 2)"; fi
+
+  # macOS 26 integration tests (order 2) need a macOS 26 runner; that job is
+  # added with the test suite so it is not a red placeholder now.
