@@ -51,8 +51,55 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+
           # --verify-tag: never create a release for a tag that does not exist
           # (workflow_dispatch runs are excluded by the `if:` above anyway).
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
-            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
-          gh release upload "$GITHUB_REF_NAME" dist/*.whl --clobber
+          gh release view "$tag" >/dev/null 2>&1 ||
+            gh release create "$tag" --verify-tag --generate-notes
+
+          # Always resolve assets through /releases/<id>/assets. Do NOT rely on
+          # the `assets` array of /releases/tags/<tag> (what `gh release view`
+          # returns): GitHub can serve that view with an EMPTY `assets` list
+          # while the asset really is on the release. That staleness is what
+          # makes `gh release upload --clobber` fail on a re-run with
+          # "HTTP 422 ... ReleaseAsset.name already exists" - clobber looks for
+          # the existing asset via the tag view, finds none, and then the plain
+          # upload collides. So: resolve the id once, and read/verify against it.
+          rel_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .id)
+
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one wheel in dist/, found ${#wheels[@]}"
+            exit 1
+          fi
+          wheel=$(basename "${wheels[0]}")
+
+          # Idempotent re-runs: drop any pre-existing asset under the same name
+          # before uploading, otherwise the upload 422s on the name collision.
+          # (Nothing to delete on a first run.)
+          asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/$rel_id/assets" \
+            --jq ".[] | select(.name == \"$wheel\") | .id" || true)
+          if [ -n "$asset_id" ]; then
+            echo "deleting pre-existing asset $wheel (id $asset_id)"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          else
+            echo "no pre-existing asset named $wheel"
+          fi
+
+          echo "uploading $wheel to release $tag (id $rel_id)"
+          gh release upload "$tag" "dist/$wheel"
+
+          # Self-verify against the authoritative endpoint: the release must end
+          # with exactly one asset, named as expected.
+          total=$(gh api "repos/$GITHUB_REPOSITORY/releases/$rel_id/assets" --jq 'length')
+          matching=$(gh api "repos/$GITHUB_REPOSITORY/releases/$rel_id/assets" \
+            --jq "[.[] | select(.name == \"$wheel\")] | length")
+          if [ "$matching" != "1" ] || [ "$total" != "1" ]; then
+            echo "::error::expected exactly one asset named $wheel; found matching=$matching total=$total"
+            gh api "repos/$GITHUB_REPOSITORY/releases/$rel_id/assets" --jq '.[].name'
+            exit 1
+          fi
+          echo "ok: release $tag carries exactly one asset, $wheel"
