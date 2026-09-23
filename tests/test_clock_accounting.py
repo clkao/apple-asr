@@ -295,8 +295,8 @@ def test_repeated_short_pauses_do_not_accumulate_over_delivery(fake):
     The declared 0.05 s is shorter than the 0.10 s pre-roll, so every one of the
     five pauses over-delivers at least 0.05 s of silence; if the session clock
     counted what was written instead of what was declared, the error would
-    accumulate across the pauses (1.25 s declared vs >1.9 s consumed here) — the
-    bug a live caller with many short pauses sees.
+    accumulate across the pauses (1.25 s declared vs 1.75 s consumed, measured) —
+    the bug a live caller with many short pauses sees.
     """
     fake.scenario({"mode": "emulate", "partial_every_frames": 4000})
     st = fake.stream(pause_commit=PAUSE_COMMIT)
