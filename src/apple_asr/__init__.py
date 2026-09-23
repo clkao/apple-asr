@@ -38,7 +38,7 @@ from .stream import Stream
 
 #: The package version. `SHIM_VERSION` is the Swift shim's own version
 #: (unchanged: its wire protocol and hello identity are untouched).
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     # session
