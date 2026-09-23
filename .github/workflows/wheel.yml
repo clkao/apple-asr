@@ -1,0 +1,58 @@
+name: wheel
+
+# Builds the platform wheel with the Swift shim *prebuilt*, so that
+# `pip install apple_asr-<version>-py3-none-macosx_26_0_arm64.whl` needs no
+# Xcode/CLT, no swiftc, and no build step.
+#
+# Runs on `macos-26` (GitHub's native arm64 macOS 26 image), which is the only
+# place the combination "macOS 26 SDK + Speech framework headers + swiftc" and
+# the target platform coincide. Publishes nothing to PyPI and needs no stored
+# credential: a workflow artifact plus, for a tag, an asset on that tag's GitHub
+# release (the actions-provided GITHUB_TOKEN, which is not a secret to manage).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # attach the wheel to the release for the tag
+
+jobs:
+  wheel:
+    name: platform wheel (macos-26, arm64)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v5
+
+      # swiftc -O -parse-as-library -> package data -> uv build --wheel ->
+      # wheel tags --platform-tag macosx_26_0_arm64 -> assertions. The same
+      # script a developer runs locally; see scripts/build_wheel.sh.
+      - name: Build the platform wheel (shim prebuilt)
+        run: bash scripts/build_wheel.sh
+
+      - name: Show the artifact
+        run: ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apple-asr-wheel-macosx_26_0_arm64
+          path: dist/*.whl
+          if-no-files-found: error
+
+      - name: Attach the wheel to the release for the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # --verify-tag: never create a release for a tag that does not exist
+          # (workflow_dispatch runs are excluded by the `if:` above anyway).
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/*.whl --clobber

@@ -44,6 +44,13 @@ filterwarnings = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/apple_asr"]
+# The prebuilt shim, staged into the package tree by scripts/build_wheel.sh, is
+# package data for the platform wheels (and only for them: it stays out of the
+# sdist, whose consumers compile it). It is normally a build product, so
+# .gitignore excludes it from git; `artifacts` re-includes it in the wheel
+# despite that, and a tree without it still builds (a source `py3-none-any`
+# wheel).
+artifacts = ["src/apple_asr/shim/apple-asr-shim"]
 
 [tool.hatch.build.targets.sdist]
 include = ["/src", "/README.md", "/LICENSE", "/pyproject.toml"]

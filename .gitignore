@@ -10,5 +10,9 @@ build/
 *.tmp
 .cache/
 
+# the shim is a build product: scripts/build_wheel.sh stages it there for the
+# platform wheels (pyproject's wheel `artifacts` re-includes it in the zip)
+src/apple_asr/shim/apple-asr-shim
+
 # agent-runtime artifacts (subagent transcripts/prompts)
 .pi-subagents/

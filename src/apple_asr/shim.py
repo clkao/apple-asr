@@ -5,8 +5,14 @@ Resolution order (first hit wins):
 2. `$APPLE_ASR_SHIM`
 3. the package cache `~/.cache/apple_asr/<shim_version>/apple-asr-shim`
 4. `apple-asr-shim` on PATH (skipping this package's own console script)
-5. build-on-demand into the cache, when a Swift toolchain is present
-6. otherwise :class:`ShimUnavailable`, naming the exact build command.
+5. the **prebuilt shim shipped as package data** by a platform wheel
+   (`apple_asr/shim/apple-asr-shim`; absent in a source install)
+6. build-on-demand into the cache, when a Swift toolchain is present
+7. otherwise :class:`ShimUnavailable`, naming the exact build command.
+
+Steps 3 and 5 are our own on-disk locations and are chmod-ed executable on
+first use, because the executable bit of wheel package data is not something to
+rely on (see :func:`ensure_executable`).
 """
 
 from __future__ import annotations
@@ -29,7 +35,9 @@ from .transport import read_hello
 __all__ = [
     "cache_root",
     "cache_path",
+    "bundled_path",
     "source_path",
+    "ensure_executable",
     "resolve_shim",
     "build_shim",
     "shim_info",
@@ -39,6 +47,9 @@ __all__ = [
 ]
 
 BUILD_COMMAND = "python -m apple_asr.build"
+
+#: The shim binary shipped inside a platform wheel as package data.
+BUNDLED_NAME = "apple-asr-shim"
 
 
 def cache_root() -> Path:
@@ -55,6 +66,44 @@ def cache_path() -> Path:
 
 def source_path() -> Path:
     return Path(__file__).resolve().parent / "shim" / "speechanalyzer.swift"
+
+
+def bundled_path() -> Path:
+    """The prebuilt shim shipped as package data by a platform wheel.
+
+    Present only in a wheel built with the binary staged into the package tree
+    (`scripts/build_wheel.sh`, `.github/workflows/wheel.yml`); a source install
+    has just the Swift source next to this path.
+    """
+    return Path(__file__).resolve().parent / "shim" / BUNDLED_NAME
+
+
+def ensure_executable(path: Path) -> bool:
+    """Make `path` executable, chmod-ing it on first use; True when it now is.
+
+    **The executable bit of wheel package data is not something to rely on.**
+    The zip member does carry a mode — hatchling records 0755 for the bundled
+    shim, and pip/uv on POSIX honour it today — but honouring it is installer
+    courtesy, not a wheel-contract guarantee. Extract the same wheel with an
+    extractor that does not restore modes (a plain `python -m zipfile -e`, an
+    artifact-zip hop, a Windows-side unzip) and the shim lands at 0644. A 0644
+    shim then fails with `EACCES` at `execv` time, which reads as "no shim"
+    rather than "shim not executable" — a confusing failure for something the
+    installer silently changed. So the resolver owns it: every path we hand out
+    from our own locations (the version cache, the bundled package data) is
+    chmod-ed here first, making the exec bit a property of *our* code rather
+    than of whatever unpacked the wheel.
+
+    Only paths this package owns are touched. A path the caller supplied
+    (`Stream(shim=...)`, `$APPLE_ASR_SHIM`, a `PATH` hit) is theirs to manage.
+    """
+    if os.access(path, os.X_OK):
+        return True
+    try:
+        path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except OSError:
+        return False  # read-only install (e.g. root-owned site-packages)
+    return os.access(path, os.X_OK)
 
 
 def _is_our_console_script(path: str) -> bool:
@@ -91,7 +140,7 @@ def resolve_shim(
         return _explicit(env, "$APPLE_ASR_SHIM")
 
     cached = cache_path()
-    if cached.exists():
+    if cached.exists() and ensure_executable(cached):
         return str(cached)
 
     found = shutil.which("apple-asr-shim")
@@ -101,12 +150,18 @@ def resolve_shim(
         if not skipped and not _is_our_console_script(resolved):
             return resolved
 
+    # The shim prebuilt into a platform wheel: no toolchain, no build step.
+    bundled = bundled_path()
+    if bundled.exists() and ensure_executable(bundled):
+        return str(bundled)
+
     if build_on_demand and shutil.which("swiftc"):
         return build_shim()
 
     raise ShimUnavailable(
         "no apple-asr-shim found. Resolution tried $APPLE_ASR_SHIM, "
-        f"{cached}, and PATH. Build one with: {BUILD_COMMAND}"
+        f"{cached}, apple-asr-shim on PATH, and the wheel's bundled shim at "
+        f"{bundled}. Build one with: {BUILD_COMMAND}"
     )
 
 
@@ -163,7 +218,7 @@ def build_shim(*, force: bool = False, quiet: bool = False) -> str:
             f"version={hello.get('shim_version')!r}, package expects "
             f"protocol={PROTOCOL_VERSION} version={SHIM_VERSION!r}"
         )
-    tmp.chmod(tmp.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    ensure_executable(tmp)  # swiftc already sets it; keep the invariant explicit
     os.replace(tmp, out)
     if not quiet:
         print(f"shim ready: {out}")

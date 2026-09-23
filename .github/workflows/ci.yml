@@ -35,6 +35,8 @@ jobs:
   # runner with the Speech framework and a built shim:
   #   python -m apple_asr.build
   #   pytest -q -m integration
-  # No such public runner exists yet (GitHub's newest is macos-15), so this job
-  # is intentionally not declared here rather than left red. Run it on a real
-  # macOS 26 machine; the tests fail loudly there if the shim cannot be resolved.
+  # `macos-26` GitHub-hosted runners do exist (wheel.yml uses one to build the
+  # platform wheel), but this job stays undeclared: it needs the on-device zh-TW
+  # asset, which the runner would have to download, and a failing integration
+  # job on every push is not worth that yet. Run it on a real macOS 26 machine;
+  # the tests fail loudly there if the shim cannot be resolved.
