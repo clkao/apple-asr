@@ -47,7 +47,7 @@ def _wire_finals(fake) -> list[dict]:
 
 
 def _drain_finals(st, timeout: float = 3.0, quiet: float = 0.25) -> list[Final]:
-    """Every `Final` still queued (the fake shim can publish several in a pause)."""
+    """Every `Final` still queued (the fake endpointer commits once per pause)."""
     out: list[Final] = []
     deadline = time.monotonic() + timeout
     quiet_until: float | None = None
@@ -259,18 +259,22 @@ def test_an_over_delivered_pause_is_attributed_to_the_session_clock(fake):
         finals.append(first)
         time.sleep(1.2)  # hold the pause open: the pump over-delivers silence
         st.pause_end(d)
-        # A long pause makes the fake endpointer re-arm and re-publish zero-width
-        # finals at the pause onset; they map there exactly and are contiguous.
+        # The endpointer latches per quiet run, so the long pause committed
+        # exactly once and the drain after `pause_end` has nothing to collect.
         finals.extend(_drain_finals(st))
         st.push(speech(0.5))
         st.flush()
         finals.extend(_drain_finals(st))
-        assert len(finals) >= 2, finals
+        # Exactly the pause commit and the flush commit: one per pause.
+        assert len(finals) == 2, [f.reason for f in finals]
+        assert [f.reason for f in finals] == ["pause", "flush"], [f.reason for f in finals]
         audio_time = st.audio_time
     finally:
         st.close()
 
-    consumed_s = fake.state()["frames"] / SAMPLE_RATE
+    state = fake.state()
+    assert len(state["quiet_commits"]) == 1, state["quiet_commits"]
+    consumed_s = state["frames"] / SAMPLE_RATE
     assert consumed_s > 1.5, (
         f"the pause did not over-deliver ({consumed_s} shim seconds vs the 1.5 s "
         f"of pushed audio plus the reported {d} s); the test would be vacuous"

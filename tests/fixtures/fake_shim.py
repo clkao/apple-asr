@@ -16,7 +16,9 @@ Scenario modes
     Behaves like the real shim: reads float32 PCM from stdin, emits a volatile
     ``partial`` every ``partial_every_frames``, and runs an *endpointer* that
     commits a ``final`` + ``commit`` once it has seen ``pause_commit`` seconds
-    of consecutive silence. Frame-exact: a final's range tiles the shim timeline
+    of consecutive silence. The endpointer latches per quiet run (the real
+    ``PauseCommitter``'s ``fired`` flag): one pause yields exactly one commit,
+    and only non-quiet audio re-arms it. Frame-exact: a final's range tiles the shim timeline
     (``range = [utterance_start, quiet_start]``), which is the worst case for
     the client's clock mapping.
 ``scripted``
@@ -83,6 +85,10 @@ class FakeShim:
         self.quiet_run = 0
         self.quiet_start: int | None = None
         self.armed: bool = False
+        #: Latch: one pause yields one commit. Set when a quiet run commits and
+        #: cleared only when non-quiet audio arrives (the real PauseCommitter's
+        #: `fired` flag), so a long continuous quiet run cannot re-arm.
+        self.fired: bool = False
         self.chunks_since_arm = 0
         self.utt_start = 0
         self.utterance_open = False
@@ -224,16 +230,18 @@ class FakeShim:
                     self.quiet_start = self.frames - frames
                 self.quiet_run += silent
             if silent < frames:
-                # Speech resumed: reset the quiet run and the endpointer arming.
+                # Speech resumed: reset the quiet run and the endpointer latch.
                 self.quiet_run = 0
                 self.quiet_start = None
                 self.armed = False
+                self.fired = False
                 self.utterance_open = True
             if self.armed:
                 self.chunks_since_arm += 1
             elif (
                 self.quiet_run >= self.pause_commit_frames
                 and self.quiet_start is not None
+                and not self.fired
                 and not self.scn.get("no_endpointer")
             ):
                 self.armed = True
@@ -364,6 +372,7 @@ class FakeShim:
                 self.quiet_commits.append({"frame": end, "wall": time.monotonic() - self.t0})
                 self.utt_start = end
                 self.armed = False
+                self.fired = True  # one commit per quiet run
                 self.chunks_since_arm = 0
                 self.utterance_open = False
                 self._last_partial_frame = frames

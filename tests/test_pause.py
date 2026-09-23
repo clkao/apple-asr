@@ -48,6 +48,7 @@ def test_pause_commit_lands_within_pause_commit_plus_epsilon(fake):
     assert state["pause_commit"] == PAUSE_COMMIT
     # The quiet run starts at the end of the pushed speech (frame 8000), quantized
     # up to the shim's read-chunk boundary (it reads 4096 B = 1024 frames at a time).
+    # Exactly one: the endpointer latches per quiet run (one pause, one commit).
     assert len(state["quiet_commits"]) == 1
     quiet_frame = state["quiet_commits"][0]["frame"]
     assert 8000 <= quiet_frame <= 8000 + 2048, quiet_frame

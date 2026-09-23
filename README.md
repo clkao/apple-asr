@@ -217,6 +217,7 @@ both sides) and ignores unknown event types with a warning.
 * The synthesized-pause mode *simulates* audio your VAD discarded; the analyzer's
   timeline then carries that silence. Preferred upstream fix (a WhisperLiveKit-side
   capability flag so silence is fed through) is a follow-up, not v1.
+* Test-suite flakes: see *Known issues* under Development.
 * The first commit is pause-bound; a speaker who never pauses commits at
   `commit_interval` — which is off by default because a ceiling cut mid-phrase and
   corrupted text.
@@ -254,6 +255,27 @@ python -m apple_asr.build
 export APPLE_ASR_CACHE="$PWD/.cache"   # only if ~/.cache is not writable
 pytest -q -m integration
 ```
+
+### Fixture attribution
+
+`tests/fixtures/audio/zh_long.wav` is a 31.55 s / 16 kHz mono clip derived from
+the `google/fleurs` corpus, which is licensed **CC-BY-4.0**; see
+`tests/fixtures/audio/README.md` for the full notice. It is a cadence fixture for
+the golden test (that golden fixture was produced from exactly this audio), not a
+general-purpose audio sample.
+
+### Known issues
+
+* **Unresolved flake in the full suite:**
+  `tests/test_control.py::test_flush_without_through_uses_the_cursor` failed once
+  in a full-suite run — it expected an exact shipped range `(0.0, 1.0)` — but
+  never in isolation (3/3 passes) or in the fake-shim subset (4/4). Suspected
+  cause: the fake shim's main loop polls its control fd *before* it reads stdin,
+  so a `finalize` command that arrives while the last pushed frames are still
+  in flight commits `through` the shim's frozen frame count, and the final lands
+  short. Draining stdin before handling a command would be the fix, but it is
+  racy by construction (the frames may not have left the writer yet); the race
+  is **unresolved** and the fake shim is left as-is.
 
 ## License
 
