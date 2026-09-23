@@ -16,8 +16,10 @@ keeps the offset of its own audio instead of the stale one the already-written
 silence implies. Compression is retroactive (a shim time already published during
 the pause can map earlier on the post-pause line), so `Transport._make_final`
 clamps `Final.start` up to the previous final's end — bounded by the
-over-delivery of that one pause — and the published ranges stay monotone. The
-over-held-pause test below is the regression test for that clamp.
+over-delivery of that one pause — and clamps the start of each of that final's
+word runs to the same boundary, so a word never leads its own final either. The
+published ranges stay monotone. The over-held-pause tests below are the
+regression tests for those two clamps (each fails if its clamp is removed).
 """
 
 from __future__ import annotations
@@ -384,6 +386,94 @@ def test_an_over_held_pause_with_a_mid_pause_final_stays_monotone(fake):
     assert after.start == mid.end, (after, mid)
     assert after.end <= audio_time + 1e-6, (after, audio_time)
     assert after.end > after.start, after
+
+
+def test_a_word_run_straddling_a_compressed_boundary_is_clamped(fake):
+    """The reviewed defect: a final's first word must not lead its own final.
+
+    A final published *during* the pause is mapped on the pause-onset line (1:1);
+    the next one is mapped on the post-pause line, shifted back by the silence
+    that pause over-delivered. The second final's `range[0]` is the same shim
+    time the first final's end came from, so its start is clamped back up to that
+    end — but its *word runs* go through the same clock, and the first run
+    straddles the boundary: mapped raw it starts before the `Final.start` it
+    belongs to. The run start is clamped to the same boundary (the previous
+    final's end); the run end is left alone, so a word that still has width keeps
+    it.
+
+    Non-vacuous by construction: the 0.10 s pre-roll is written with `d=0.0`
+    reported, so the over-delivery (and therefore the compression) is at least
+    0.10 s — the mapped first-run start is always behind the boundary.
+    """
+    fake.scenario(
+        {
+            "mode": "scripted",
+            "steps": [
+                {
+                    "on": "frames",
+                    "value": PREROLL_FRAMES + 6400,  # push 0.4 + the 0.10 s pre-roll
+                    "emit": {
+                        "type": "final",
+                        "text": "mid",
+                        "range": [0.0, 0.4],
+                        "runs": [["a", 0.0, 0.4]],
+                    },
+                },
+                {
+                    # `cmd` rather than `frames`: the emission must land after
+                    # the resume push and its clock update, never during the pump.
+                    "on": "cmd",
+                    "value": "prepare",
+                    "emit": {
+                        "type": "final",
+                        "text": "after",
+                        "range": [0.4, 0.8],
+                        "runs": [["b", 0.4, 0.75], ["c", 0.75, 0.8]],
+                    },
+                },
+            ],
+        }
+    )
+    st = fake.stream(pause_commit=PAUSE_COMMIT)
+    finals: list[Final] = []
+    try:
+        st.push(speech(0.4))  # shim frame 6400
+        st.pause_start()  # pre-roll -> 8000
+        mid = _wait_final(st)
+        assert mid is not None and mid.text == "mid", mid
+        finals.append(mid)
+        st.pause_end(0.0)  # declared 0 s: everything written for the pause is excess
+        st.push(speech(0.4))
+        st.prepare()
+        after = _wait_final(st)
+        assert after is not None and after.text == "after", after
+        finals.append(after)
+        audio_time = st.audio_time
+    finally:
+        st.close()
+
+    consumed_s = fake.state()["frames"] / SAMPLE_RATE
+    declared = 0.4 + 0.0 + 0.4
+    assert audio_time == pytest.approx(declared, abs=1e-9), audio_time
+    assert consumed_s > declared + 0.05, (
+        f"the pause did not over-deliver ({consumed_s} shim seconds vs the {declared} s "
+        f"declared); the test would be vacuous"
+    )
+    assert [mid.start, mid.end] == [0.0, 0.4], mid
+    assert [mid.words[0].start, mid.words[0].end] == [0.0, 0.4]
+    _assert_no_overlap(finals)
+    # The second final's own start is clamped to the boundary compression moved
+    # it across ...
+    assert after.start == mid.end, (after, mid)
+    # ... and the first of its word runs straddles that boundary: unclamped it
+    # would start behind its own final.
+    first, second = after.words
+    assert (first.text, second.text) == ("b", "c")
+    assert first.start == mid.end, (first, mid)
+    assert first.start < first.end, "the run was swallowed whole, not straddled"
+    assert first.end <= second.start + 1e-9, (first, second)
+    assert all(w.start >= after.start - 1e-9 for w in after.words), after.words
+    assert all(w.end >= w.start for w in after.words), after.words
 
 
 def test_push_only_sessions_are_unchanged(fake):

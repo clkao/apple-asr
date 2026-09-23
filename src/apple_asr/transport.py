@@ -75,9 +75,10 @@ class SessionClock:
     the pre-pause line) can sit after the next final mapped on the post-pause
     line. The re-ordering is bounded by the over-delivery of that one pause (its
     pre-roll plus the pumped ticks the caller did not declare), and
-    :meth:`Transport._make_final` clamps `Final.start` up to the previous final's
-    end to absorb it. Nothing else is clamped and no timestamp is pulled
-    backwards; the mapped ranges stay monotone and non-overlapping.
+    :meth:`Transport._make_final` clamps `Final.start` — and, to the same
+    boundary, the start of each of that final's word runs — up to the previous
+    final's end to absorb it. No timestamp is pulled backwards; the mapped ranges
+    stay monotone and non-overlapping.
     """
 
     #: The negotiated sample rate (the shim timeline unit; SPEC.md §5).
@@ -600,15 +601,21 @@ class Transport:
         # pre-roll plus the pumped ticks the caller did not declare), and clamping
         # the start is what keeps the published ranges monotone. Only the start is
         # clamped: pulling an end backwards would move audio that has already been
-        # attributed. tests/test_clock_accounting.py covers it (the
-        # over-held-pause test fails if this clamp is removed).
+        # attributed. The final's word runs are clamped to the same boundary (see
+        # `_make_words`), so a run that straddles the compressed boundary cannot
+        # start before its own final either. tests/test_clock_accounting.py covers
+        # both (the over-held-pause tests fail if either clamp is removed).
         rng = obj.get("range") or [0.0, 0.0]
         raw_start = float(rng[0] if rng and rng[0] is not None else 0.0)
         raw_end = float(rng[1] if len(rng) > 1 and rng[1] is not None else raw_start)
+        # The boundary this final's start is clamped to, and the one its word
+        # runs are clamped to below: the previous final's end, i.e. the value in
+        # force *before* this final updates it.
+        boundary = self._last_final_end
         start = self.clock.map(raw_start)
         end = self.clock.map(raw_end)
-        if start < self._last_final_end:
-            start = self._last_final_end
+        if start < boundary:
+            start = boundary
         if end < start:  # a wire range narrower than the clamp
             end = start
         self._last_final_end = end
@@ -617,9 +624,23 @@ class Transport:
             pending = self._pending_reasons.popleft() if self._pending_reasons else None
         reason = wire_reason or pending or "pause"
         return Final(text=str(obj.get("text") or ""), start=start, end=end,
-                     words=self._make_words(obj), reason=reason)
+                     words=self._make_words(obj, floor=boundary), reason=reason)
 
-    def _make_words(self, obj: dict[str, Any]) -> tuple[Word, ...]:
+    def _make_words(self, obj: dict[str, Any], floor: float = 0.0) -> tuple[Word, ...]:
+        """Map a final's `runs` onto `Word`s, clamped at `floor`.
+
+        `floor` is the boundary `_make_final` clamped this final's `start` up to
+        (the previous final's end; `0.0` for a partial, which has no such
+        boundary). Runs go through the same clock as the final they belong to, so
+        a run straddling a compressed boundary — the pause whose over-delivery
+        `pause_end(d)` compressed out of the timeline — would otherwise start
+        *before* the `Final.start` it is part of; the mapped run start is clamped
+        up the same way, so a word never leads its own final. The nudge is bounded
+        by one pause's over-delivery (that pause's pre-roll plus the pumped ticks
+        the caller did not declare), the same bound as the `Final.start` clamp.
+        Only the start is clamped: an end is never pulled backwards, and
+        `end >= start` always holds.
+        """
         runs = obj.get("runs") or []
         words: list[Word] = []
         for run in runs:
@@ -631,14 +652,13 @@ class Transport:
             conf = None
             if len(run) > 3 and run[3] is not None:
                 conf = float(run[3])
-            words.append(
-                Word(
-                    text=text,
-                    start=self.clock.map(float(run[1])),
-                    end=self.clock.map(float(run[2])),
-                    confidence=conf,
-                )
-            )
+            start = self.clock.map(float(run[1]))
+            end = self.clock.map(float(run[2]))
+            if start < floor:
+                start = floor
+            if end < start:  # a wire run narrower than the clamp
+                end = start
+            words.append(Word(text=text, start=start, end=end, confidence=conf))
         self._counts["words"] += len(words)
         return tuple(words)
 

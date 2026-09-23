@@ -168,8 +168,9 @@ ranges tile its timeline and one of those boundaries can sit inside the compress
 region: a final already published mid-pause can be followed by one whose start maps
 earlier. `Transport` therefore clamps `Final.start` up to the previous final's end —
 bounded by that one pause's over-delivery (its pre-roll plus the pumped ticks you did
-not declare), and nothing else is clamped. The published ranges stay monotone and
-never overlap; no timestamp is ever pulled backwards.
+not declare) — and clamps the start of each of that final's word runs to the same
+boundary, so a word never leads the `Final` it belongs to either; no end is ever
+pulled backwards. The published ranges stay monotone and never overlap.
 
 `Stream.audio_time` is that declared timeline. It equals the audio the shim has
 consumed exactly when you never hold a pause open past the duration you report
@@ -177,7 +178,8 @@ consumed exactly when you never hold a pause open past the duration you report
 over-held pause, where `audio_time` is the shorter, correct one. See
 `tests/test_clock_accounting.py` for the regression tests (mid-pause exactness, the
 reviewed over-held pause, repeated short pauses that must not accumulate error, and
-the clamp that keeps the over-held case monotone). Once a future transport carries
+the two clamps — final start and word-run start — that keep the over-held case
+monotone). Once a future transport carries
 the true audio, no anchor is ever needed and the mapping is identity; any future
 transport (C ABI, shared memory) must preserve these semantics, not the JSONL wire
 format.
