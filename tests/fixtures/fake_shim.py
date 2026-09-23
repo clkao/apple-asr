@@ -9,6 +9,10 @@ It is driven by a *scenario file* (JSON) whose path comes from the
 ``APPLE_ASR_FAKE_STATE`` is set it dumps an observability JSON on exit (frames
 consumed, commands seen, every wire event emitted, the argv the client passed).
 That dump is how tests assert on the wire rather than on their own bookkeeping.
+When ``APPLE_ASR_FAKE_PID`` is set its own pid is written there at startup,
+before ``hello`` — a kill leaves no state dump, and `/bin/ps` is not available
+to the sandboxed test process — so a test can still tell whether the child it
+never got a handle on is alive.
 
 Scenario modes
 --------------
@@ -298,6 +302,7 @@ class FakeShim:
     # Main loop
     # ------------------------------------------------------------------
     def run(self) -> int:
+        self.dump_pid()
         self.emit_hello()
         for raw in self.scn.get("raw_lines") or []:
             sys.stdout.write(raw + "\n")
@@ -436,6 +441,21 @@ class FakeShim:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+    def dump_pid(self) -> None:
+        """Record our pid before `hello` (see the module docstring).
+
+        Not a post-mortem dump: a SIGKILLed shim never reaches `dump_state`, and
+        that is exactly the case a caller-side leak test has to observe.
+        """
+        path = os.environ.get("APPLE_ASR_FAKE_PID")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(f"{os.getpid()}\n")
+        except OSError:
+            pass
+
     def dump_state(self, status: str) -> None:
         path = os.environ.get("APPLE_ASR_FAKE_STATE")
         if not path:

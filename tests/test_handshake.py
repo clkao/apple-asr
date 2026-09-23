@@ -5,10 +5,18 @@ Runs anywhere: the fake shim is a Python script and the cache is a tmp dir.
 
 from __future__ import annotations
 
-import pytest
-from support import drain, speech
+import threading
 
-from apple_asr import PROTOCOL_VERSION, BackendError, ProtocolMismatch
+import pytest
+from support import (
+    drain,
+    live_threads_since,
+    process_alive,
+    speech,
+    wait_for,
+)
+
+from apple_asr import PROTOCOL_VERSION, AppleAsrError, BackendError, ProtocolMismatch
 
 
 def test_handshake_accepts_matching_protocol(fake):
@@ -84,3 +92,48 @@ def test_lines_emitted_with_hello_are_not_lost(fake):
     events = drain(st)
     texts = [e.text for e in events if type(e).__name__ == "Partial"]
     assert texts == ["p0", "p1", "p2"]
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        pytest.param({"protocol": 999}, id="protocol-mismatch"),
+        pytest.param(
+            {"first_line": {"type": "partial", "text": "boo", "range": [0, 1]}},
+            id="first-line-not-hello",
+        ),
+        pytest.param(
+            {"format": {"sample_rate": 8000, "channels": 1, "common_format": "int16"}},
+            id="format-mismatch",
+        ),
+    ],
+)
+def test_a_rejected_handshake_kills_the_child_it_spawned(fake, scenario):
+    """A failed `hello` validation must not leak the child it spawned for.
+
+    `Transport` spawns the shim before it validates the `hello` line, and a
+    failed `Stream(...)` hands the caller nothing, so no `close()`/`shutdown()`
+    can ever reach that child. Before the fix the process outlived the failed
+    construction for the life of the session: the stderr-capture thread holds the
+    `Popen` (and therefore the child's stdin pipe), so the child never even saw
+    EOF. `ignore_eof` makes the child's lifetime depend only on being killed, not
+    on whether a garbage-collected pipe happens to close its stdin.
+
+    The child records its own pid before `hello` (`APPLE_ASR_FAKE_PID`), which is
+    the only handle a test can have on a process the constructor refused to hand
+    back; `/bin/ps` is denied to the sandboxed test process.
+    """
+    fake.scenario({**scenario, "ignore_eof": True})
+    threads_before = {t.ident for t in threading.enumerate()}
+    with pytest.raises(AppleAsrError):
+        fake.stream()
+
+    pid = fake.shim_pid()
+    assert wait_for(lambda: not process_alive(pid), timeout=5.0), (
+        f"the shim child (pid {pid}) outlived the failed handshake"
+    )
+    assert wait_for(lambda: not live_threads_since(threads_before), timeout=5.0), (
+        "threads outlived the failed handshake: "
+        f"{live_threads_since(threads_before)} (the paragraph-silence pump is "
+        "started after the transport, so it cannot be one of them)"
+    )

@@ -398,18 +398,56 @@ class Transport:
         os.close(self._ctl_r)
 
         self._stderr_thread: threading.Thread | None = None
-        if stderr_mode == "capture":
-            self._stderr_thread = threading.Thread(
-                target=self._stderr_loop, name="apple-asr-stderr", daemon=True
+        try:
+            if stderr_mode == "capture":
+                self._stderr_thread = threading.Thread(
+                    target=self._stderr_loop, name="apple-asr-stderr", daemon=True
+                )
+                self._stderr_thread.start()
+
+            self.hello = self._read_and_validate_hello(hello_timeout)
+
+            self._reader = threading.Thread(
+                target=self._read_loop, name="apple-asr-reader", daemon=True
             )
-            self._stderr_thread.start()
+            self._reader.start()
+        except BaseException:
+            # The constructor is raising, so the caller never receives a
+            # Transport and cannot `shutdown()` one: a rejected `hello` (bad,
+            # missing, wrong protocol, wrong format) would leak a live child,
+            # its stderr pump and the control-channel fd. Tear them down here,
+            # best-effort, without masking the original exception.
+            self._abort_startup()
+            raise
 
-        self.hello = self._read_and_validate_hello(hello_timeout)
+    def _abort_startup(self) -> None:
+        """Best-effort teardown after a failed startup. Never raises.
 
-        self._reader = threading.Thread(
-            target=self._read_loop, name="apple-asr-reader", daemon=True
-        )
-        self._reader.start()
+        The child is killed (not asked to exit) because nothing else can reach
+        it; killing it also closes its stderr, which is what unblocks and ends
+        the capture thread. Called only from `__init__`'s failure path.
+        """
+        try:
+            os.close(self._ctl_w)
+        except OSError:
+            pass
+        stdin = self._proc.stdin
+        if stdin is not None:
+            try:
+                stdin.close()
+            except OSError:
+                pass
+        try:
+            _kill(self._proc)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        for thread in (self._stderr_thread, getattr(self, "_reader", None)):
+            if thread is None or thread is threading.current_thread():
+                continue
+            try:
+                thread.join(timeout=5.0)
+            except Exception:  # pragma: no cover - defensive
+                pass
 
     # ------------------------------------------------------------------
     # Hello

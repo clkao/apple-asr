@@ -53,6 +53,10 @@ class FakeBackend:
         self.cache = root / "cache"
         self.scenario_path = root / "scenario.json"
         self.state_path = root / "shim-state.json"
+        #: The fake shim writes its own pid here on startup, before `hello`, so a
+        #: test can tell whether a child it never got a handle on is still alive
+        #: (see `process_alive`). `/bin/ps` is not usable from the sandbox.
+        self.pid_path = root / "shim.pid"
         self.bin_dir = self.cache / "apple_asr" / SHIM_VERSION
         self.bin_dir.mkdir(parents=True, exist_ok=True)
         self.shim_path = self.bin_dir / "apple-asr-shim"
@@ -61,6 +65,7 @@ class FakeBackend:
         monkeypatch.setenv("APPLE_ASR_CACHE", str(self.cache))
         monkeypatch.setenv("APPLE_ASR_FAKE_SCENARIO", str(self.scenario_path))
         monkeypatch.setenv("APPLE_ASR_FAKE_STATE", str(self.state_path))
+        monkeypatch.setenv("APPLE_ASR_FAKE_PID", str(self.pid_path))
         monkeypatch.setenv("APPLE_ASR_FAKE_MAX_WALL_S", "30")
         monkeypatch.delenv("APPLE_ASR_SHIM", raising=False)
         self.scenario({})
@@ -100,6 +105,21 @@ class FakeBackend:
         """A `Stream` resolving the fake shim through the tmp cache."""
         kw.setdefault("locale", "zh-TW")
         return Stream(**kw)
+
+    def shim_pid(self, timeout: float = 10.0) -> int:
+        """The pid the fake shim recorded at startup (waits for it to land)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                text = self.pid_path.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                text = ""
+            if text.isdigit():
+                return int(text)
+            time.sleep(0.02)
+        raise AssertionError(
+            f"the fake shim recorded no pid at {self.pid_path}: it never started"
+        )
 
 
 #: Test-only platform simulation. ``APPLE_ASR_TEST_PLATFORM`` forces what the
@@ -177,6 +197,36 @@ def wait_for(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
             return True
         time.sleep(interval)
     return False
+
+
+def process_alive(pid: int) -> bool:
+    """True while `pid` names a live (not necessarily ours) process.
+
+    The signal-0 probe, used instead of `/bin/ps`: the agent sandbox denies
+    `ps` outright, and a pid the fake shim recorded is a stronger handle on the
+    child than a command-line match anyway. A reaped child is gone; a live one
+    answers. `PermissionError` means the pid exists but is not ours.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # pragma: no cover - same-user children only
+        return True
+    return True
+
+
+def live_threads_since(idents: set) -> list[str]:
+    """Names of threads alive now that were not in the `idents` snapshot."""
+    import threading
+
+    return [
+        t.name
+        for t in threading.enumerate()
+        if t.ident not in idents and t.is_alive()
+    ]
 
 
 def types(events: list) -> list[str]:
