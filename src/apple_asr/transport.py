@@ -140,12 +140,6 @@ class SessionClock:
         with self._lock:
             return self._session_s
 
-    @property
-    def drift(self) -> float:
-        """The offset in force at the current point (`session - shim` seconds)."""
-        with self._lock:
-            return self._session_s - (self._written_frames / self._RATE)
-
     def map(self, shim_s: float) -> float:
         """Shim seconds -> session seconds (never negative)."""
         with self._lock:
