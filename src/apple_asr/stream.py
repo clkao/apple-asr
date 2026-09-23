@@ -17,7 +17,9 @@ Clock
 Session timestamps are seconds on a clock that starts at 0 and advances with
 consumed audio, including synthesized pauses. The shim owns the audio timeline
 (frames written == its clock); the client maps shim time -> session time with a
-drift term while it synthesizes pauses (:class:`~apple_asr.transport.SessionClock`).
+boundary-anchored anchor refreshed at every input boundary, which keeps a final
+that lands mid-pause on its own audio's timeline
+(:class:`~apple_asr.transport.SessionClock`).
 
 Modes
 -----
@@ -92,8 +94,9 @@ _PAUSE_PREROLL_MIN_S = 0.10
 #: these steps — a lump at the pause onset is not enough: the transcriber
 #: publishes the commit only once more audio keeps arriving (same finding as the
 #: reference driver). Under 1.0 so `pause_end(d)` always tops up to exactly `d`
-#: instead of over-delivering, which would shift the drift and let consecutive
-#: final ranges overlap.
+#: instead of over-delivering silence the caller never reported; if a caller does
+#: hold the pause past `d`, the clock counts that excess as the consumed audio it
+#: is, so the two timelines stay 1:1 (`SessionClock`).
 _SILENCE_TICK_S = 0.05
 _SILENCE_PUMP_RATE = 0.8
 
@@ -351,6 +354,7 @@ class Stream:
         self._transport.write_audio(frames.tobytes())
         self._clock.add_written(n, SAMPLE_RATE)
         self._clock.add_session(n / SAMPLE_RATE)
+        self._clock.anchor()
         if self._pause_open:
             # Speech resumed without an explicit pause_end: close the pause bookkeeping.
             with self._pause_cv:
@@ -373,6 +377,11 @@ class Stream:
             self._pause_written = 0
             self._pump_idle.clear()
             self._pause_cv.notify_all()
+        # Anchor the mapping at the pause onset *before* the pre-roll: the
+        # pre-roll and the pump are synthesized silence the caller has not
+        # reported yet (it reports `d` at `pause_end`), so the session clock must
+        # not follow them (SessionClock).
+        self._clock.anchor()
         # Pre-roll so the shim's PauseCommitter fires immediately; the pump then
         # keeps delivering silence for as long as the pause is open.
         self._write_silence(self._preroll_frames)
@@ -382,11 +391,14 @@ class Stream:
     def pause_end(self, duration_s: float) -> None:
         """Announce a VAD pause end, with its true duration in seconds.
 
-        The synthesized silence for this pause totals exactly `duration_s`
-        (pre-roll + pump + top-up), so the session clock advances by exactly what
-        you fed. Keeping a pause open longer than the `duration_s` you report
-        adds the excess silence to the timeline (documented behaviour, not a
-        correction).
+        The synthesized silence for this pause totals `duration_s` (pre-roll +
+        pump + top-up) whenever you do not hold the pause open past it, and the
+        session clock — which advances with consumed audio (SPEC.md §3.3) —
+        advances by exactly that silence. Holding the pause open longer makes the
+        pump over-deliver (`P > duration_s`); that excess is real elapsed audio
+        the shim consumed, so it is counted here too, which is what keeps the
+        shim and session timelines 1:1 (and therefore keeps mapped final ranges
+        contiguous). See :class:`~apple_asr.transport.SessionClock`.
         """
         self._require_open()
         if duration_s < 0:
@@ -400,7 +412,8 @@ class Stream:
         remainder = target - self._pause_written
         if remainder > 0:
             self._write_silence(remainder)
-        self._clock.add_session(float(duration_s))
+        self._clock.add_session(max(self._pause_written, target) / SAMPLE_RATE)
+        self._clock.anchor()
         with self._pause_cv:
             self._pause_written = 0
 

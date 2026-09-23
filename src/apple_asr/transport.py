@@ -41,26 +41,47 @@ STDERR_TAIL_LINES = 60
 class SessionClock:
     """Maps the shim's frame timeline onto the session clock (SPEC.md §5).
 
-    The shim owns the audio timeline (frames written == its clock). The client
-    writes synthesized pause silence, so the two timelines differ by a drift
-    term, `drift = session_consumed - written`:
+    The shim owns the audio timeline (frames written == its clock), and SPEC.md
+    §3.3 defines the session clock as advancing with **consumed audio, including
+    synthesized pauses**. The two timelines are therefore 1:1, and the client's
+    job is only to keep them 1:1 while a pause is *open*: the pre-roll and the
+    pump write silence whose duration the caller reports at `pause_end`, so the
+    session clock has not counted that audio yet and neither may the mapping.
 
-    * `push()` advances both (real audio);
-    * the pause pre-roll and the pause silence pump advance only `written`, so
-      the commit a pause produces maps back onto the pause onset instead of
-      onto the synthetic silence after it;
-    * `pause_end(d)` advances the session clock by the caller's true `d`.
+    The mapping is boundary-anchored: an anchor pair `(shim_frame, session_s)` is
+    refreshed at every input boundary — each `push()`, `pause_start()` and
+    `pause_end(d)` (:meth:`anchor`) — and a shim time `t` maps as
+    `session_anchor + (t * rate - shim_anchor) / rate`, the open segment running
+    1:1 from the anchor. The anchor is moved only when the new point sits on the
+    same 1:1 line (`_same_offset`), i.e. when that boundary did not leave the two
+    timelines apart:
 
-    Over-delivered silence (a pause shorter than one pre-roll, or a caller that
-    waits past `d`) is absorbed into the drift, never dropped. Mapping is not
-    clamped: a monotonic clamp would wrongly pin a late-arriving final (whose
-    range covers earlier audio) to the newest partial's end.
+    * `push()` and `pause_end(d)` advance both timelines by the same audio, so
+      they move the anchor;
+    * while a pause is open the pump keeps writing silence the session clock has
+      not counted, so the *pause-onset* anchor stays in force and a shim time
+      inside the pause maps 1:1 from the pause onset — where the audio the final
+      covers really was — instead of being pulled back by the already-written
+      synthesized silence (the old global `drift = session - written`, which is
+      transiently stale mid-pause).
+
+    Because every boundary leaves the two timelines 1:1 (`Stream.pause_end`
+    advances the session clock by the silence actually written, which is exactly
+    the reported `d` whenever the caller does not hold the pause open past it),
+    the mapping is monotonically non-decreasing and 1:1. The shim's final ranges
+    tile its timeline, so the mapped ranges tile the session timeline:
+    consecutive finals cannot overlap and :class:`Transport` needs no clamp.
     """
+
+    #: The negotiated sample rate (the shim timeline unit; SPEC.md §5).
+    _RATE = int(NEGOTIATED_FORMAT["sample_rate"])
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._written_frames = 0
         self._session_s = 0.0
+        #: The anchor pair the open segment extends from, `(shim_frame, session_s)`.
+        self._anchor: tuple[int, float] = (0, 0.0)
 
     def add_written(self, frames: int, rate: int) -> None:
         with self._lock:
@@ -70,6 +91,29 @@ class SessionClock:
         with self._lock:
             self._session_s += seconds
 
+    def anchor(self) -> None:
+        """Refresh the anchor at an input boundary.
+
+        Called at the end of every `push()`, and around the synthesized silence at
+        `pause_start()` (before the pre-roll) and `pause_end(d)` (after the
+        session clock has been advanced by that silence). A point that is not on
+        the anchor's 1:1 line — a `push()` during an open pause, whose pumped
+        silence the session clock has not counted — leaves the pause-onset anchor
+        in force.
+        """
+        with self._lock:
+            point = (self._written_frames, self._session_s)
+            if point != self._anchor and self._same_offset(point, self._anchor):
+                self._anchor = point
+
+    @staticmethod
+    def _same_offset(a: tuple[int, float], b: tuple[int, float]) -> bool:
+        """True when two points sit on the same 1:1 shim/session line."""
+        return (
+            abs((a[1] - a[0] / SessionClock._RATE) - (b[1] - b[0] / SessionClock._RATE))
+            <= 1e-9
+        )
+
     @property
     def session_s(self) -> float:
         with self._lock:
@@ -77,15 +121,15 @@ class SessionClock:
 
     @property
     def drift(self) -> float:
+        """The offset in force at the current point (`session - shim` seconds)."""
         with self._lock:
-            return self._session_s - (self._written_frames / NEGOTIATED_FORMAT["sample_rate"])
+            return self._session_s - (self._written_frames / self._RATE)
 
     def map(self, shim_s: float) -> float:
         """Shim seconds -> session seconds (never negative)."""
         with self._lock:
-            mapped = shim_s + self._session_s - (
-                self._written_frames / NEGOTIATED_FORMAT["sample_rate"]
-            )
+            anchor_f, anchor_s = self._anchor
+            mapped = anchor_s + (shim_s * self._RATE - anchor_f) / self._RATE
         return mapped if mapped > 0.0 else 0.0
 
 
@@ -296,11 +340,6 @@ class Transport:
         self._commit_count = 0
         self._pending_reasons: deque[str] = deque()
 
-        # Finals are contiguous by contract (§3.3). Synthesized pause silence
-        # can shift the drift by a few ms mid-pause, so enforce contiguity here
-        # rather than emit overlapping ranges.
-        self._last_final_end = 0.0
-
         # Bytes of stdout read while waiting for `hello`; the reader thread must
         # consume them first (see `_readline_with_timeout`).
         self._hello_leftover = b""
@@ -484,27 +523,22 @@ class Transport:
         )
 
     def _make_final(self, obj: dict[str, Any]) -> Final:
-        # `Final.start` is clamped up to the previous final's end (SPEC.md §3.3:
-        # ranges never overlap). The clamp is load-bearing, not cosmetic: while a
-        # pause is open the client has already written its synthesized silence
-        # but the shim's commit for it only *arrives* a moment later, so the two
-        # finals are mapped with different drift terms and the new final's start
-        # maps before the previous final's end. Measured in
-        # tests/test_clock_accounting.py: 0.05 s (one pump tick) in the ordinary
-        # push/pause/pause_end cycle, up to the 0.10 s pre-roll when the commits
-        # land at different offsets into their pauses. Clamping restores
-        # contiguity; that test is the regression test (it fails if this clamp is
-        # removed). See ORDER2-REPORT.md, decision D-4.
+        # No clamp on `Final.start`: `SessionClock` maps the shim timeline 1:1 and
+        # monotonically (its anchor keeps that true while a pause's already-written
+        # silence is still unreported), and the shim's final ranges tile its
+        # timeline, so the mapped ranges are contiguous by construction (SPEC.md
+        # §3.3). Order 1 needed the clamp because a mid-pause final used to be
+        # mapped with the global drift, which the synthesized silence had already
+        # made stale (measured 0.05 s, up to the 0.10 s pre-roll) and which nudged
+        # the timestamp. tests/test_clock_accounting.py is the regression test for
+        # the exactness that makes the clamp unnecessary.
         rng = obj.get("range") or [0.0, 0.0]
         raw_start = float(rng[0] if rng and rng[0] is not None else 0.0)
         raw_end = float(rng[1] if len(rng) > 1 and rng[1] is not None else raw_start)
         start = self.clock.map(raw_start)
         end = self.clock.map(raw_end)
-        if start < self._last_final_end:
-            start = self._last_final_end
-        if end < start:
+        if end < start:  # malformed wire range only; a monotone map preserves order
             end = start
-        self._last_final_end = end
         wire_reason = obj.get("reason")
         with self._commit_cv:
             pending = self._pending_reasons.popleft() if self._pending_reasons else None

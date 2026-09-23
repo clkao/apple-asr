@@ -36,7 +36,9 @@ from .protocol import PROTOCOL_VERSION, SHIM_VERSION
 from .shim import build_shim, ensure_installed, list_locales, shim_info
 from .stream import Stream
 
-__version__ = SHIM_VERSION
+#: The package version. `SHIM_VERSION` is the Swift shim's own version
+#: (unchanged: its wire protocol and hello identity are untouched).
+__version__ = "0.1.1"
 
 __all__ = [
     # session

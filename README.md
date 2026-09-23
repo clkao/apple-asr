@@ -109,18 +109,35 @@ your VAD strips silence, this client synthesizes that silence back (a pre-roll a
 tops up to exactly `d` seconds — asserted frame-exactly in the test suite).
 
 Session timestamps start at 0, advance with consumed audio **including
-synthesized pauses**, and are monotonic seconds. The client maps shim time →
-session time with a drift term (`drift = session_consumed − frames_written`), so a
-commit that the framework publishes a few milliseconds into the synthetic silence
-still maps back onto the pause onset instead of onto audio you never fed. Once a
-future transport carries the true audio (no client-side synthesis), the drift
-term becomes zero and the mapping is identity; any future transport (C ABI,
-shared memory) must preserve these semantics, not the JSONL wire format.
+synthesized pauses** (SPEC §3.3), and are monotonic seconds. The client maps shim
+time → session time with a boundary-anchored pair: an anchor `(shim_frame,
+session_s)` is refreshed at every input boundary — each `push()`,
+`pause_start()` and `pause_end(d)` — and a shim time `t` maps as
+`anchor_session + (t·rate − anchor_shim_frame)/rate`, 1:1 from the anchor. The
+anchor is what keeps the two timelines aligned where it matters: the pre-roll and
+the pump write synthesized silence the caller only reports at `pause_end`, so
+while a pause is open the **pause-onset anchor stays in force** and shim times
+inside the pause map 1:1 from the pause onset — a commit the framework publishes a
+few milliseconds into that silence maps back onto the pause onset instead of being
+pulled back by silence you had already fed but not yet reported (the old global
+`drift = session_consumed − frames_written`, which is transiently stale mid-pause).
+Once a future transport carries the true audio, no anchor is ever needed and the
+mapping is identity; any future transport (C ABI, shared memory) must preserve
+these semantics, not the JSONL wire format.
 
-Because two finals can be mapped with slightly different drift (each lands during
-its own pause), the transport additionally clamps `Final.start` up to the previous
-final's end. That is what keeps §"ranges never overlap" true; see
-`tests/test_clock_accounting.py` for the regression tests.
+This is what keeps §"ranges never overlap" true *by construction* — the mapping is
+monotonically non-decreasing and 1:1, and the shim's final ranges tile its
+timeline, so consecutive mapped ranges are contiguous with no clamp and no nudged
+timestamp (`Final.start` is the shim's own range start, mapped). If you hold a
+pause open longer than the `d` you report, the pump has already written more
+silence (`P > d`); that excess is real elapsed audio the shim consumed, so the
+session clock gains it too (it advances with consumed audio) and the two timelines
+stay 1:1 — `Stream.audio_time` follows the consumed audio, not the sum of the
+durations you reported. Counting only `d` would leave the clocks apart for the rest
+of the session, and the first final after the pause would map back over the one the
+pause already published. See `tests/test_clock_accounting.py` for the regression
+tests (mid-pause exactness, the engineered drift-divergence case, and the
+over-delivered pause).
 
 ## Input modes (both first-class)
 
