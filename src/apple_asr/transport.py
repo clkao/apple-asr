@@ -41,36 +41,43 @@ STDERR_TAIL_LINES = 60
 class SessionClock:
     """Maps the shim's frame timeline onto the session clock (SPEC.md §5).
 
-    The shim owns the audio timeline (frames written == its clock), and SPEC.md
-    §3.3 defines the session clock as advancing with **consumed audio, including
-    synthesized pauses**. The two timelines are therefore 1:1, and the client's
-    job is only to keep them 1:1 while a pause is *open*: the pre-roll and the
-    pump write silence whose duration the caller reports at `pause_end`, so the
-    session clock has not counted that audio yet and neither may the mapping.
+    The session clock is the **caller's declared timeline**: pushed audio plus
+    the pause durations the caller reports at `pause_end(d)`. That is the
+    timeline the caller's own VAD runs on, so it is the one every reported
+    timestamp must be on. The shim's frame timeline is what the client actually
+    fed it (frames written == its clock) and is *longer* whenever a pause is
+    held open past the `d` it is reported with: the pre-roll and the silence pump
+    keep writing while the caller waits for the transcriber's final (a live
+    pipeline holds every pause up to ~0.3 s). That excess belongs to the shim,
+    not to the caller's timeline, so the two timelines legitimately diverge by
+    the accumulated over-delivery.
 
     The mapping is boundary-anchored: an anchor pair `(shim_frame, session_s)` is
     refreshed at every input boundary — each `push()`, `pause_start()` and
-    `pause_end(d)` (:meth:`anchor`) — and a shim time `t` maps as
-    `session_anchor + (t * rate - shim_anchor) / rate`, the open segment running
-    1:1 from the anchor. The anchor is moved only when the new point sits on the
-    same 1:1 line (`_same_offset`), i.e. when that boundary did not leave the two
-    timelines apart:
+    `pause_end(d)` (:meth:`anchor` / :meth:`reanchor`) — and a shim time `t` maps
+    as `session_anchor + (t * rate - shim_anchor) / rate`, the open segment
+    running 1:1 from the anchor:
 
-    * `push()` and `pause_end(d)` advance both timelines by the same audio, so
-      they move the anchor;
+    * `push()` advances both timelines by the same audio, and `pause_end(d)`
+      advances the session clock by exactly `d` and re-establishes the anchor
+      unconditionally (:meth:`reanchor`), so the section after the pause runs 1:1
+      from the caller's declared cursor — over-delivered silence is compressed
+      out of the timeline instead of being carried into every later timestamp;
     * while a pause is open the pump keeps writing silence the session clock has
-      not counted, so the *pause-onset* anchor stays in force and a shim time
-      inside the pause maps 1:1 from the pause onset — where the audio the final
-      covers really was — instead of being pulled back by the already-written
-      synthesized silence (the old global `drift = session - written`, which is
-      transiently stale mid-pause).
+      not counted yet, so the *pause-onset* anchor stays in force (:meth:`anchor`
+      moves it only onto the same 1:1 line) and a shim time inside the pause maps
+      1:1 from the pause onset — where the audio the final covers really was —
+      instead of being pulled back by the already-written synthesized silence
+      (the old global `drift = session - written`, transiently stale mid-pause).
 
-    Because every boundary leaves the two timelines 1:1 (`Stream.pause_end`
-    advances the session clock by the silence actually written, which is exactly
-    the reported `d` whenever the caller does not hold the pause open past it),
-    the mapping is monotonically non-decreasing and 1:1. The shim's final ranges
-    tile its timeline, so the mapped ranges tile the session timeline:
-    consecutive finals cannot overlap and :class:`Transport` needs no clamp.
+    Compressing the over-delivered section is *retroactive*: the shim's final
+    ranges tile its timeline, so a final already published mid-pause (mapped on
+    the pre-pause line) can sit after the next final mapped on the post-pause
+    line. The re-ordering is bounded by the over-delivery of that one pause (its
+    pre-roll plus the pumped ticks the caller did not declare), and
+    :meth:`Transport._make_final` clamps `Final.start` up to the previous final's
+    end to absorb it. Nothing else is clamped and no timestamp is pulled
+    backwards; the mapped ranges stay monotone and non-overlapping.
     """
 
     #: The negotiated sample rate (the shim timeline unit; SPEC.md §5).
@@ -92,19 +99,32 @@ class SessionClock:
             self._session_s += seconds
 
     def anchor(self) -> None:
-        """Refresh the anchor at an input boundary.
+        """Refresh the anchor at an input boundary, if that point is on its line.
 
-        Called at the end of every `push()`, and around the synthesized silence at
-        `pause_start()` (before the pre-roll) and `pause_end(d)` (after the
-        session clock has been advanced by that silence). A point that is not on
-        the anchor's 1:1 line — a `push()` during an open pause, whose pumped
-        silence the session clock has not counted — leaves the pause-onset anchor
-        in force.
+        Called at the end of every `push()`, and at `pause_start()` (before the
+        pre-roll). A point that is not on the anchor's 1:1 line — a `push()`
+        during an open pause, whose pumped silence the session clock has not
+        counted — leaves the pause-onset anchor in force.
         """
         with self._lock:
             point = (self._written_frames, self._session_s)
             if point != self._anchor and self._same_offset(point, self._anchor):
                 self._anchor = point
+
+    def reanchor(self) -> None:
+        """Move the anchor to the current point whatever line it sits on.
+
+        Used by `Stream.pause_end(d)` once the session clock has advanced by the
+        caller's declared `d`: the silence actually written may exceed it (a
+        pause held open past its reported duration), and that excess is on the
+        shim's timeline but not the caller's. Re-anchoring drops the exhausted
+        line, so the mapping runs 1:1 from the caller's declared cursor and no
+        later timestamp is ahead by the accumulated over-delivery. When nothing
+        was over-delivered the point is already on the anchor's line and this is
+        a no-op.
+        """
+        with self._lock:
+            self._anchor = (self._written_frames, self._session_s)
 
     @staticmethod
     def _same_offset(a: tuple[int, float], b: tuple[int, float]) -> bool:
@@ -340,6 +360,12 @@ class Transport:
         self._commit_count = 0
         self._pending_reasons: deque[str] = deque()
 
+        # Finals are non-overlapping by contract (§3.3). Compressing an
+        # over-delivered pause into the caller's timeline at `pause_end` can move
+        # a shim time that was already published mid-pause onto a later one, so
+        # contiguity is enforced here rather than assumed.
+        self._last_final_end = 0.0
+
         # Bytes of stdout read while waiting for `hello`; the reader thread must
         # consume them first (see `_readline_with_timeout`).
         self._hello_leftover = b""
@@ -523,22 +549,31 @@ class Transport:
         )
 
     def _make_final(self, obj: dict[str, Any]) -> Final:
-        # No clamp on `Final.start`: `SessionClock` maps the shim timeline 1:1 and
-        # monotonically (its anchor keeps that true while a pause's already-written
-        # silence is still unreported), and the shim's final ranges tile its
-        # timeline, so the mapped ranges are contiguous by construction (SPEC.md
-        # §3.3). Order 1 needed the clamp because a mid-pause final used to be
-        # mapped with the global drift, which the synthesized silence had already
-        # made stale (measured 0.05 s, up to the 0.10 s pre-roll) and which nudged
-        # the timestamp. tests/test_clock_accounting.py is the regression test for
-        # the exactness that makes the clamp unnecessary.
+        # `Final.start` is clamped up to the previous final's end (SPEC.md §3.3:
+        # ranges never overlap). The clamp is load-bearing, not cosmetic:
+        # `Stream.pause_end(d)` advances the session clock by the caller's
+        # declared `d`, so the shim's over-delivered pause silence is compressed
+        # out of the timeline at that call. The shim's final ranges tile *its*
+        # timeline, one of those boundaries can lie inside the over-delivered
+        # region, and the final already published mid-pause was mapped on the
+        # pre-pause line while the next one is mapped on the post-pause line: that
+        # same shim time now maps earlier, i.e. before the end already reported.
+        # The re-ordering is bounded by the over-delivery of that one pause (its
+        # pre-roll plus the pumped ticks the caller did not declare), and clamping
+        # the start is what keeps the published ranges monotone. Only the start is
+        # clamped: pulling an end backwards would move audio that has already been
+        # attributed. tests/test_clock_accounting.py covers it (the
+        # over-held-pause test fails if this clamp is removed).
         rng = obj.get("range") or [0.0, 0.0]
         raw_start = float(rng[0] if rng and rng[0] is not None else 0.0)
         raw_end = float(rng[1] if len(rng) > 1 and rng[1] is not None else raw_start)
         start = self.clock.map(raw_start)
         end = self.clock.map(raw_end)
-        if end < start:  # malformed wire range only; a monotone map preserves order
+        if start < self._last_final_end:
+            start = self._last_final_end
+        if end < start:  # a wire range narrower than the clamp
             end = start
+        self._last_final_end = end
         wire_reason = obj.get("reason")
         with self._commit_cv:
             pending = self._pending_reasons.popleft() if self._pending_reasons else None

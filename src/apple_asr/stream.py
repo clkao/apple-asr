@@ -14,12 +14,15 @@ Both are first-class:
 
 Clock
 -----
-Session timestamps are seconds on a clock that starts at 0 and advances with
-consumed audio, including synthesized pauses. The shim owns the audio timeline
-(frames written == its clock); the client maps shim time -> session time with a
-boundary-anchored anchor refreshed at every input boundary, which keeps a final
-that lands mid-pause on its own audio's timeline
-(:class:`~apple_asr.transport.SessionClock`).
+Session timestamps are seconds on the **caller's declared timeline**: it starts
+at 0 and advances with audio you pushed plus the pause durations you report at
+`pause_end(d)`. The shim owns its own audio timeline (frames written == its
+clock), which is longer whenever you hold a pause open past the `d` you report
+(the pre-roll and the pump keep writing while you wait for a final); that excess
+is compressed out of the session timeline at `pause_end`, and the client maps
+shim time -> session time with a boundary-anchored anchor refreshed at every
+input boundary, which keeps a final that lands mid-pause on its own audio's
+timeline (:class:`~apple_asr.transport.SessionClock`).
 
 Modes
 -----
@@ -94,9 +97,9 @@ _PAUSE_PREROLL_MIN_S = 0.10
 #: these steps — a lump at the pause onset is not enough: the transcriber
 #: publishes the commit only once more audio keeps arriving (same finding as the
 #: reference driver). Under 1.0 so `pause_end(d)` always tops up to exactly `d`
-#: instead of over-delivering silence the caller never reported; if a caller does
-#: hold the pause past `d`, the clock counts that excess as the consumed audio it
-#: is, so the two timelines stay 1:1 (`SessionClock`).
+#: instead of over-delivering silence you never reported; if you do hold the pause
+#: past `d`, that excess is compressed out of the session timeline at `pause_end`
+#: (your declared durations define the timeline — `SessionClock`).
 _SILENCE_TICK_S = 0.05
 _SILENCE_PUMP_RATE = 0.8
 
@@ -379,8 +382,9 @@ class Stream:
             self._pause_cv.notify_all()
         # Anchor the mapping at the pause onset *before* the pre-roll: the
         # pre-roll and the pump are synthesized silence the caller has not
-        # reported yet (it reports `d` at `pause_end`), so the session clock must
-        # not follow them (SessionClock).
+        # reported yet (it reports `d` at `pause_end`, which re-anchors from the
+        # declared cursor and compresses any over-delivery out of the timeline),
+        # so the session clock must not follow them (SessionClock).
         self._clock.anchor()
         # Pre-roll so the shim's PauseCommitter fires immediately; the pump then
         # keeps delivering silence for as long as the pause is open.
@@ -391,14 +395,15 @@ class Stream:
     def pause_end(self, duration_s: float) -> None:
         """Announce a VAD pause end, with its true duration in seconds.
 
-        The synthesized silence for this pause totals `duration_s` (pre-roll +
-        pump + top-up) whenever you do not hold the pause open past it, and the
-        session clock — which advances with consumed audio (SPEC.md §3.3) —
-        advances by exactly that silence. Holding the pause open longer makes the
-        pump over-deliver (`P > duration_s`); that excess is real elapsed audio
-        the shim consumed, so it is counted here too, which is what keeps the
-        shim and session timelines 1:1 (and therefore keeps mapped final ranges
-        contiguous). See :class:`~apple_asr.transport.SessionClock`.
+        The session clock advances by exactly `duration_s`: **your declared
+        durations define the timeline**, so every timestamp the package reports
+        is on your own audio timeline whether or not you held the pause open
+        longer than you reported. The synthesized silence written for one pause
+        totals `duration_s` (pre-roll + pump + top-up) whenever you do not hold
+        it past that; holding it longer makes the shim consume extra silence,
+        which is compressed out of the session timeline here instead of being
+        carried into later timestamps — `Stream.audio_time` never gains it. See
+        :class:`~apple_asr.transport.SessionClock`.
         """
         self._require_open()
         if duration_s < 0:
@@ -412,8 +417,13 @@ class Stream:
         remainder = target - self._pause_written
         if remainder > 0:
             self._write_silence(remainder)
-        self._clock.add_session(max(self._pause_written, target) / SAMPLE_RATE)
-        self._clock.anchor()
+        # The declared duration is the timeline: advance the session clock by
+        # exactly `d` (never by the silence actually written, which is longer for
+        # an over-held pause) and re-anchor unconditionally, so the section after
+        # the pause runs 1:1 from the caller's cursor and the over-delivered
+        # silence is compressed out of every later timestamp (SessionClock).
+        self._clock.add_session(float(duration_s))
+        self._clock.reanchor()
         with self._pause_cv:
             self._pause_written = 0
 
@@ -461,7 +471,14 @@ class Stream:
 
     @property
     def audio_time(self) -> float:
-        """Seconds consumed on the session clock."""
+        """Seconds on the session clock: your declared timeline, not the shim's.
+
+        Pushed audio plus the pause durations reported so far. Identical to the
+        audio the shim has consumed whenever you never hold a pause open past the
+        duration you report at `pause_end(d)`; a caller that does over-hold (a
+        live VAD waiting for the transcriber's final) sees the shorter declared
+        timeline, which is the one every reported timestamp is on.
+        """
         return self._clock.session_s
 
     @property
