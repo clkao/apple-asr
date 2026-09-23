@@ -1,7 +1,9 @@
 """SPEC.md §9 test 9 — platform gating.
 
 `require_supported()` is the single choke point; the simulated platform is
-monkeypatched here so the gate is tested on linux CI too.
+monkeypatched here so the gate is tested on linux CI too. Marked
+``real_platform_gate`` so conftest's neutralization (which unblocks the fake-shim
+tests on any OS) leaves this module exercising the real gate.
 """
 
 from __future__ import annotations
@@ -11,6 +13,8 @@ import sys
 import pytest
 
 from apple_asr import Stream, UnsupportedPlatform, list_locales, shim_info
+
+pytestmark = pytest.mark.real_platform_gate
 
 
 @pytest.fixture

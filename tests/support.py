@@ -102,8 +102,37 @@ class FakeBackend:
         return Stream(**kw)
 
 
+#: Test-only platform simulation. ``APPLE_ASR_TEST_PLATFORM`` forces what the
+#: §8 gate and the integration-skip decision see, so the ubuntu CI failure is
+#: reproducible on a macOS host (and the macOS 26 path testable anywhere). No
+#: product code reads this: on a real host the gate still uses the real platform.
+SIMULATED_PLATFORMS: dict[str, tuple[str, int]] = {
+    "linux": ("linux", 0),
+    "macos25": ("darwin", 25),
+    "macos26": ("darwin", 26),
+}
+TEST_PLATFORM_ENV = "APPLE_ASR_TEST_PLATFORM"
+
+
+def forced_platform() -> tuple[str, int] | None:
+    """The ``(sys.platform, macOS major)`` the test-only knob forces, if any."""
+    forced = os.environ.get(TEST_PLATFORM_ENV)
+    if not forced:
+        return None
+    try:
+        return SIMULATED_PLATFORMS[forced]
+    except KeyError:
+        raise ValueError(
+            f"{TEST_PLATFORM_ENV} must be one of {sorted(SIMULATED_PLATFORMS)}; got {forced!r}"
+        ) from None
+
+
 def macos26_available() -> bool:
     """True on macOS 26+ (where the real shim and the Speech framework exist)."""
+    forced = forced_platform()
+    if forced is not None:
+        sim_platform, major = forced
+        return sim_platform == "darwin" and major >= 26
     if sys.platform != "darwin":
         return False
     try:

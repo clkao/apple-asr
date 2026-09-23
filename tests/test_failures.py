@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+import warnings
 
 import pytest
 from support import drain, speech, wait_for
@@ -67,16 +68,20 @@ def test_malformed_and_unknown_lines_warn_but_do_not_crash(fake):
             ],
         }
     )
-    with pytest.warns(RuntimeWarning) as record:
-        st = fake.stream()
-        events: list = []
-        for _ in range(2):
-            st.push(speech(0.2))
-            assert wait_for(
-                lambda: _collect(st, events), timeout=3.0
-            ), "a partial should have arrived"
-        st.close()
-        events.extend(drain(st))
+    # simplefilter("always"): assert both warnings even if an earlier test
+    # already tripped Python's per-location "default" dedup.
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        with pytest.warns(RuntimeWarning) as record:
+            st = fake.stream()
+            events: list = []
+            for _ in range(2):
+                st.push(speech(0.2))
+                assert wait_for(lambda: _collect(st, events), timeout=3.0), (
+                    "a partial should have arrived"
+                )
+            st.close()
+            events.extend(drain(st))
 
     messages = [str(w.message) for w in record]
     assert any("malformed JSON" in m for m in messages), messages

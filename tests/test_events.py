@@ -6,6 +6,8 @@ mapping, and `Final.reason` is propagated from the `commit` acknowledgement.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 from support import drain, speech, types
 
@@ -139,10 +141,14 @@ def test_runs_are_optional_and_unknown_event_types_are_ignored(fake):
             ],
         }
     )
-    with pytest.warns(RuntimeWarning, match="unknown event type"):
-        with fake.stream() as st:
-            st.push(speech(0.2))
-        events = drain(st)
+    # simplefilter("always"): the same warning must be assertable even if an
+    # earlier test already tripped Python's per-location "default" dedup.
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        with pytest.warns(RuntimeWarning, match="unknown event type"):
+            with fake.stream() as st:
+                st.push(speech(0.2))
+            events = drain(st)
 
     partial = next(e for e in events if isinstance(e, Partial))
     assert partial.words == ()
