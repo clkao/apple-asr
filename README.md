@@ -22,20 +22,51 @@ Both beat every local MLX backend on that board (best: qwen3-1.7B, 18.20). The
 
 ## Install
 
+**From a platform wheel — no Swift toolchain needed.** The `wheel` workflow
+(`.github/workflows/wheel.yml`, run on a `macos-26` runner) compiles the shim
+into the package and attaches the resulting wheel to the GitHub release for the
+tag:
+
+```bash
+pip install ./apple_asr-0.1.1-py3-none-macosx_26_0_arm64.whl   # or the release URL
+python -c "import apple_asr; print(apple_asr.shim_info())"      # uses the bundled shim
+```
+
+No Xcode CLT, no `swiftc`, no build step: the first `Stream(...)` runs the shim
+that shipped inside the wheel. The wheel is **platform-tagged**
+(`macosx_26_0_arm64`, not `py3-none-any`) so pip refuses it on Intel Macs and on
+macOS < 26 — where the bundled arm64 binary could not run at all.
+
+**From source — needs a Swift toolchain.**
+
 ```bash
 pip install apple-asr              # or: uv pip install apple-asr
 python -m apple_asr.build          # compiles the bundled Swift shim into the cache
 ```
 
-Requires **macOS 26+**; elsewhere the package raises `UnsupportedPlatform` with
-the requirement in the message. The build step needs a Swift toolchain
-(`swiftc`); if it is missing you get `ShimUnavailable` naming the exact command.
-The first session for a locale may download that locale's on-device asset
-(`ensure_installed("zh-TW")` does it explicitly).
+Requires **macOS 26+** either way; elsewhere the package raises
+`UnsupportedPlatform` with the requirement in the message. The source build needs
+a Swift toolchain (`swiftc`); if it is missing you get `ShimUnavailable` naming
+the exact command. The first session for a locale may download that locale's
+on-device asset (`ensure_installed("zh-TW")` does it explicitly).
 
 The shim is resolved in this order (first hit wins): `Stream(shim=...)` →
-`$APPLE_ASR_SHIM` → the package cache `~/.cache/apple_asr/<version>/apple-asr-shim`
-→ `apple-asr-shim` on `PATH` → build-on-demand → `ShimUnavailable`.
+`$APPLE_ASR_SHIM` → the package cache
+`~/.cache/apple_asr/<version>/apple-asr-shim` → `apple-asr-shim` on `PATH` →
+**the shim bundled in the wheel**, `apple_asr/shim/apple-asr-shim` (absent from a
+source install) → build-on-demand → `ShimUnavailable`.
+
+**Executable bit.** The executable bit of wheel package data is not something
+to rely on. The zip member carries a mode (hatchling records 0755, and pip/uv on
+POSIX honour it today), but honouring it is installer courtesy, not a wheel
+contract — unpack the same wheel with an extractor that does not restore modes
+(`python -m zipfile -e`, an artifact-zip hop, a Windows-side unzip) and the shim
+lands at `0644`. A `0644` shim then fails at `execv` with `EACCES`, which reads
+as "no shim" rather than "shim not executable". The resolver therefore
+`chmod +x`es the shim on first use, for the two locations the package owns (the
+version cache and the bundled copy). A path you supply yourself
+(`Stream(shim=...)`, `$APPLE_ASR_SHIM`, a `PATH` hit) is left alone. See
+`apple_asr.shim.ensure_executable`.
 
 **Cache escape hatch.** The cache root is `$APPLE_ASR_CACHE` (falling back to
 `$XDG_CACHE_HOME`, then `~/.cache`). Set it when `~/.cache` is not writable —
@@ -255,6 +286,29 @@ python -m apple_asr.build
 export APPLE_ASR_CACHE="$PWD/.cache"   # only if ~/.cache is not writable
 pytest -q -m integration
 ```
+
+### Building a platform wheel yourself
+
+CI and a local build run the same script (`bash scripts/build_wheel.sh`; the
+workflow only adds checkout/UV setup, artifact upload and the release asset):
+
+```bash
+bash scripts/build_wheel.sh        # -> dist/apple_asr-0.1.1-py3-none-macosx_26_0_arm64.whl
+```
+
+It compiles the shim (`swiftc -O -parse-as-library`) into
+`src/apple_asr/shim/apple-asr-shim`, builds the ordinary `py3-none-any` wheel with
+`uv build --wheel`, then retags it with `wheel tags --platform-tag
+macosx_26_0_arm64 --remove`. The retag is deliberate: the package is pure Python
+with one bundled binary, so a single `py3-none-<platform>` wheel should serve
+CPython 3.10-3.13 on macOS 26 arm64. The alternative — a setuptools
+`BinaryDistribution.has_ext_modules()` override — would emit an
+interpreter-specific `cp313-cp313-macosx_...` wheel per Python version (and mean
+leaving hatchling) for no benefit. The script refuses to finish unless the binary
+is arm64, the tag is platform-specific, `apple_asr/shim/apple-asr-shim` is inside
+the zip, and the `any`-tagged original is gone. `PLATFORM_TAG=...` overrides the
+tag. The binary is a build product (`.gitignore`) that pyproject's wheel
+`artifacts` re-includes in the zip, and the sdist never carries it.
 
 ### Fixture attribution
 
